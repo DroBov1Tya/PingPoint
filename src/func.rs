@@ -1,17 +1,25 @@
-use reqwest::Client;
+use reqwest::{Client, Proxy};
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use tokio::sync::Semaphore;
 use tokio::task;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
-use clap::{Arg, Command};
 use crossterm::{cursor, terminal, ExecutableCommand};
 use std::{fs, io::{self, stdout, BufRead, BufReader, Write}, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
 
 mod user_agents;
+mod art;
 
-async fn req(webpath: &str, endpoint: &str, random_agent: bool) -> Result<String, Box<dyn std::error::Error  + Send + Sync>> {
-    let client = Client::new();
+async fn req(webpath: &str, endpoint: &str, random_agent: bool, proxy: Option<String>) -> Result<String, Box<dyn std::error::Error  + Send + Sync>> {
+    let client = if let Some(proxy_url) = proxy {
+        Client::builder()
+            .proxy(Proxy::all(&proxy_url)?)
+            .danger_accept_invalid_certs(true)
+            .build()?
+    } else {
+        Client::new()
+    };
+
     let mut request = client.get(&format!("{}{}", webpath, endpoint));
 
     let mut rng = StdRng::from_entropy();
@@ -27,68 +35,12 @@ async fn req(webpath: &str, endpoint: &str, random_agent: bool) -> Result<String
     let result = request.send().await?;
 
     let status_code = result.status();
-    let result_str: String = format!("{}{}: STATUS_CODE = {}", webpath, endpoint, status_code);
+    let result_str: String = format!("
+    URL:    {}{}\n
+    STATUS: {}\n", 
+    webpath, endpoint, status_code);
 
     Ok(result_str)
-}
-
-pub fn parse_args() -> (String, String, bool, usize) {
-    let matches = Command::new("request-app")
-        .version("1.0")
-        .author("Your Name <your.email@example.com>")
-        .about("HTTP Client for making requests")
-        .arg(
-            Arg::new("url")
-                .short('u')
-                .long("url")
-                .value_name("URL")
-                .help("Specifies the base URL")
-                .required(true)
-                .num_args(1),
-        )
-        .arg(
-            Arg::new("endpoint")
-                .short('e')
-                .long("endpoint")
-                .value_name("ENDPOINT")
-                .help("Specifies an endpoint or a file containing endpoints")
-                .required(true)
-                .num_args(1),
-        )
-        .arg(
-            Arg::new("threads")
-            .short('t')
-            .long("threads")
-            .value_name("THREADS")
-            .help("Max threads")
-            .required(false)
-            .num_args(1)
-            .value_parser(clap::value_parser!(usize)),
-        )
-        .arg(
-            Arg::new("random-agent")
-                .long("random-agent")
-                .help("Use a random user agent")
-                .action(clap::ArgAction::SetTrue)
-                .required(false),
-        )
-        .get_matches();
-
-    
-    let webpath = matches.get_one::<String>("url").unwrap().to_string() + "/";
-    let endpoint = matches.get_one::<String>("endpoint").unwrap().to_string();
-    let random_agent = matches.get_flag("random-agent");
-    let threads = matches
-        .get_one::<usize>("threads")
-        .copied()
-        .unwrap_or(1);
-    
-    if threads > 50 {
-        eprintln!("Error: The number of threads must be between 1 and 50");
-        std::process::exit(1);
-    }
-
-    (webpath, endpoint, random_agent, threads)
 }
 
 pub async fn read_user_agents() -> [String; 1000] {
@@ -114,7 +66,6 @@ pub async fn read_user_agents() -> [String; 1000] {
 async fn clear_output(message: Option<&str>, stage: bool) {
     match stage{
         true => {
-            stdout().execute(cursor::MoveUp(1)).unwrap();
             stdout().execute(terminal::Clear(terminal::ClearType::CurrentLine)).unwrap();
             println!("{}", message.unwrap());
             
@@ -133,37 +84,49 @@ pub async fn process(
     webpath:String, 
     endpoint: String, 
     random_agent: bool, 
-    threads: usize) 
+    threads: usize,
+    proxy: Option<String>) 
     -> Result<(), Box<dyn std::error::Error>>{
 
-    let webpath = Arc::new(webpath);
-    let random_agent = Arc::new(random_agent);
-    let progress = Arc::new(AtomicUsize::new(0));
-    let semaphore = Arc::new(Semaphore::new(threads));
-
     stdout().execute(terminal::Clear(terminal::ClearType::All))?;
+    println!("{}\n", art::ART);
     stdout().execute(cursor::Hide)?;
 
     if let Ok(file) = fs::File::open(&endpoint) {
-        let mut handles = Vec::new();
         let reader = BufReader::new(file);
+
+        let webpath = Arc::new(webpath);
+        let random_agent = Arc::new(random_agent);
+        let proxy = Arc::new(proxy);
         let endpoints: Vec<_> = reader.lines().collect::<Result<_, _>>()?;
+        
+        let progress = Arc::new(AtomicUsize::new(0));
         let total = endpoints.len();
+
+        let semaphore = Arc::new(Semaphore::new(threads));
+        let mut handles = Vec::new();
 
         for endpoint in endpoints {
             let random_agent = *random_agent;
             let webpath = Arc::clone(&webpath);
+            let proxy = Arc::clone(&proxy);
             let progress = Arc::clone(&progress);
             let semaphore = Arc::clone(&semaphore);
 
             let handle = task::spawn(async move {
                 let permit = semaphore.acquire_owned().await.unwrap();
-                let result = req(&webpath, &endpoint, random_agent).await;
+                let result;
+
+                if let Some(proxy) = proxy.as_deref() {
+                    result = req(&webpath, &endpoint, random_agent, Some(proxy.to_string())).await;
+                } else {
+                    result = req(&webpath, &endpoint, random_agent, None).await;
+                }
                 let output = match &result {
-                    Ok(res) => res.clone(),  // Клонируем значение, чтобы использовать его дважды
-                    Err(e) => format!("Error: {}", e), // Преобразуем ошибку в строку
+                    Ok(res) => res.clone(),
+                    Err(e) => format!("Error: {}", e),
                 };
-                println!("{}", output);
+                println!("-----------------------------------------");
                 clear_output(Some(&output), true).await;
 
                 drop(permit);
@@ -179,10 +142,13 @@ pub async fn process(
             handle.await?;
         }
         clear_output(None, false).await;
+        stdout().execute(cursor::MoveDown(1)).unwrap();
     } else {
-        match req(webpath.as_str(), &endpoint, *random_agent).await {
-            Ok(res) => println!("{}", res),
-            Err(_) => println!("{}{}: STATUS_CODE = error", webpath.as_str(), &endpoint),
+        if proxy.is_some(){
+            match req(webpath.as_str(), &endpoint, random_agent, proxy).await {
+                Ok(res) => println!("{}", res),
+                Err(e) => println!("Error: {}\n URL: {}{}", webpath.as_str(), &endpoint, e),
+        }
         }
     }
     Ok(())
