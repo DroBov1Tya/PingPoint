@@ -1,21 +1,38 @@
 use reqwest::Client;
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use tokio::sync::Semaphore;
+use tokio::task;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
 use clap::{Arg, Command};
+use crossterm::{cursor, terminal, ExecutableCommand};
+use std::{fs, io::{self, stdout, BufRead, BufReader, Write}, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
 
-pub async fn req(webpath: &str, endpoint: &str) -> Result<String, Box<dyn std::error::Error>> {
+mod user_agents;
+
+async fn req(webpath: &str, endpoint: &str, random_agent: bool) -> Result<String, Box<dyn std::error::Error  + Send + Sync>> {
     let client = Client::new();
+    let mut request = client.get(&format!("{}{}", webpath, endpoint));
 
-    let response = client
-    .get(&format!("{}{}", webpath, endpoint))
-    .send()
-    .await?;
+    let mut rng = StdRng::from_entropy();
+    let user_agent = read_user_agents().await;
+    let random = rng.gen_range(0..=user_agent.len() - 1);
 
-    let status_code = response.status();
+    if random_agent {
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent[random])?);
+        request = request.headers(headers);
+    }
+    
+    let result = request.send().await?;
+
+    let status_code = result.status();
     let result_str: String = format!("{}{}: STATUS_CODE = {}", webpath, endpoint, status_code);
 
     Ok(result_str)
 }
 
-pub fn parse_args() -> (String, String, usize) {
+pub fn parse_args() -> (String, String, bool, usize) {
     let matches = Command::new("request-app")
         .version("1.0")
         .author("Your Name <your.email@example.com>")
@@ -48,11 +65,19 @@ pub fn parse_args() -> (String, String, usize) {
             .num_args(1)
             .value_parser(clap::value_parser!(usize)),
         )
+        .arg(
+            Arg::new("random-agent")
+                .long("random-agent")
+                .help("Use a random user agent")
+                .action(clap::ArgAction::SetTrue)
+                .required(false),
+        )
         .get_matches();
 
     
     let webpath = matches.get_one::<String>("url").unwrap().to_string() + "/";
     let endpoint = matches.get_one::<String>("endpoint").unwrap().to_string();
+    let random_agent = matches.get_flag("random-agent");
     let threads = matches
         .get_one::<usize>("threads")
         .copied()
@@ -63,5 +88,102 @@ pub fn parse_args() -> (String, String, usize) {
         std::process::exit(1);
     }
 
-    (webpath, endpoint, threads)
+    (webpath, endpoint, random_agent, threads)
+}
+
+pub async fn read_user_agents() -> [String; 1000] {
+    let mut user_agents_array: [String; 1000] = std::array::from_fn(|_| String::new());
+
+    let user_agents_iter = user_agents::USER_AGENTS
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.to_string());
+
+    // Заполняем массив строками из итератора
+    for (i, user_agent) in user_agents_iter.enumerate() {
+        if i < 1000 {
+            user_agents_array[i] = user_agent;
+        } else {
+            break;
+        }
+    }
+
+    user_agents_array
+}
+
+async fn clear_output(message: Option<&str>, stage: bool) {
+    match stage{
+        true => {
+            stdout().execute(cursor::MoveUp(1)).unwrap();
+            stdout().execute(terminal::Clear(terminal::ClearType::CurrentLine)).unwrap();
+            println!("{}", message.unwrap());
+            
+            stdout().execute(cursor::MoveDown(1)).unwrap();
+            io::stdout().flush().unwrap();
+        }
+        false => {
+            let _ = stdout().execute(terminal::Clear(terminal::ClearType::CurrentLine));
+            println!("\nAll requests completed.");
+            let _ = stdout().execute(cursor::Show);
+        }
+    }
+}
+
+pub async fn process(
+    webpath:String, 
+    endpoint: String, 
+    random_agent: bool, 
+    threads: usize) 
+    -> Result<(), Box<dyn std::error::Error>>{
+
+    let webpath = Arc::new(webpath);
+    let random_agent = Arc::new(random_agent);
+    let progress = Arc::new(AtomicUsize::new(0));
+    let semaphore = Arc::new(Semaphore::new(threads));
+
+    stdout().execute(terminal::Clear(terminal::ClearType::All))?;
+    stdout().execute(cursor::Hide)?;
+
+    if let Ok(file) = fs::File::open(&endpoint) {
+        let mut handles = Vec::new();
+        let reader = BufReader::new(file);
+        let endpoints: Vec<_> = reader.lines().collect::<Result<_, _>>()?;
+        let total = endpoints.len();
+
+        for endpoint in endpoints {
+            let random_agent = *random_agent;
+            let webpath = Arc::clone(&webpath);
+            let progress = Arc::clone(&progress);
+            let semaphore = Arc::clone(&semaphore);
+
+            let handle = task::spawn(async move {
+                let permit = semaphore.acquire_owned().await.unwrap();
+                let result = req(&webpath, &endpoint, random_agent).await;
+                let output = match &result {
+                    Ok(res) => res.clone(),  // Клонируем значение, чтобы использовать его дважды
+                    Err(e) => format!("Error: {}", e), // Преобразуем ошибку в строку
+                };
+                println!("{}", output);
+                clear_output(Some(&output), true).await;
+
+                drop(permit);
+
+                let completed = progress.fetch_add(1, Ordering::SeqCst) + 1;
+
+                print!("\rProgress: {}/{} | ", completed, total);
+                io::stdout().flush().unwrap();
+            });
+            handles.push(handle);
+        }
+        for handle in handles {
+            handle.await?;
+        }
+        clear_output(None, false).await;
+    } else {
+        match req(webpath.as_str(), &endpoint, *random_agent).await {
+            Ok(res) => println!("{}", res),
+            Err(_) => println!("{}{}: STATUS_CODE = error", webpath.as_str(), &endpoint),
+        }
+    }
+    Ok(())
 }
